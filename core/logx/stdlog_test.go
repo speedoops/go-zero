@@ -12,8 +12,8 @@ import (
 
 const testlog = "Stay hungry, stay foolish."
 
-func TestCollectSysLog(t *testing.T) {
-	CollectSysLog()
+func TestCollectStdLog(t *testing.T) {
+	CollectStdLog()
 	content := getContent(captureOutput(func() {
 		log.Print(testlog)
 	}))

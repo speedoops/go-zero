@@ -36,6 +36,18 @@ func (l *traceLogger) Errorv(v interface{}) {
 	}
 }
 
+func (l *traceLogger) Warn(v ...interface{}) {
+	if shallLog(WarnLevel) {
+		l.write(warnLog, levelWarn, formatWithCaller(fmt.Sprint(v...), durationCallerDepth))
+	}
+}
+
+func (l *traceLogger) Warnf(format string, v ...interface{}) {
+	if shallLog(WarnLevel) {
+		l.write(warnLog, levelWarn, formatWithCaller(fmt.Sprintf(format, v...), durationCallerDepth))
+	}
+}
+
 func (l *traceLogger) Info(v ...interface{}) {
 	if shallLog(InfoLevel) {
 		l.write(infoLog, levelInfo, fmt.Sprint(v...))
@@ -54,8 +66,20 @@ func (l *traceLogger) Infov(v interface{}) {
 	}
 }
 
+func (l *traceLogger) Debug(v ...interface{}) {
+	if shallLog(DebugLevel) {
+		l.write(debugLog, levelDebug, fmt.Sprint(v...))
+	}
+}
+
+func (l *traceLogger) Debugf(format string, v ...interface{}) {
+	if shallLog(DebugLevel) {
+		l.write(debugLog, levelDebug, fmt.Sprintf(format, v...))
+	}
+}
+
 func (l *traceLogger) Slow(v ...interface{}) {
-	if shallLog(ErrorLevel) {
+	if shallLog(WarnLevel) {
 		l.write(slowLog, levelSlow, fmt.Sprint(v...))
 	}
 }
@@ -78,12 +102,22 @@ func (l *traceLogger) WithDuration(duration time.Duration) Logger {
 }
 
 func (l *traceLogger) write(writer io.Writer, level string, val interface{}) {
-	l.Timestamp = getTimestamp()
-	l.Level = level
+	// 1. build log entry
+	if !writeRsyslog {
+		l.Timestamp = getTimestamp()
+		l.Level = level
+	}
 	l.Content = val
 	l.Trace = traceIdFromContext(l.ctx)
 	l.Span = spanIdFromContext(l.ctx)
-	outputJson(writer, l)
+
+	// 2. output to writer
+	if formatToRawTxt {
+		text := fmt.Sprintf("%s %s %s: %s %s %s\n", l.Timestamp, l.Level, l.Duration, l.Trace, l.Span, l.Content)
+		outputRawTxt(writer, text)
+		return
+	}
+	outputJson(writer, *l)
 }
 
 // WithContext sets ctx to log, for keeping tracing information.

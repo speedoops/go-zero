@@ -9,6 +9,43 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestWithDurationErrorFormatToRawTxt(t *testing.T) {
+	var builder strings.Builder
+	log.SetOutput(&builder)
+	formatToRawTxt = true
+	WithDuration(time.Second).Error("foo")
+	assert.True(t, strings.Contains(builder.String(), "duration"), builder.String())
+	formatToRawTxt = false
+}
+
+func TestWithDurationWarn(t *testing.T) {
+	var builder strings.Builder
+	log.SetOutput(&builder)
+	WithDuration(time.Second).Warn("foo")
+	assert.True(t, strings.Contains(builder.String(), "duration"), builder.String())
+}
+
+func TestWithDurationWarnf(t *testing.T) {
+	var builder strings.Builder
+	log.SetOutput(&builder)
+	WithDuration(time.Second).Warnf("foo")
+	assert.True(t, strings.Contains(builder.String(), "duration"), builder.String())
+}
+
+func TestWithDurationDebug(t *testing.T) {
+	var builder strings.Builder
+	log.SetOutput(&builder)
+	WithDuration(time.Second).Debug("foo")
+	assert.True(t, strings.Contains(builder.String(), "duration"), builder.String())
+}
+
+func TestWithDurationDebugf(t *testing.T) {
+	var builder strings.Builder
+	log.SetOutput(&builder)
+	WithDuration(time.Second).Debugf("foo")
+	assert.True(t, strings.Contains(builder.String(), "duration"), builder.String())
+}
+
 func TestWithDurationError(t *testing.T) {
 	var builder strings.Builder
 	log.SetOutput(&builder)

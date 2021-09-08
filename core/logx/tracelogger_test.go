@@ -19,6 +19,16 @@ const (
 
 var mock tracespec.Trace = new(mockTrace)
 
+func TestTraceLogFormatToRawTxt(t *testing.T) {
+	var buf mockWriter
+	atomic.StoreUint32(&initialized, 1)
+	formatToRawTxt = true
+	ctx := context.WithValue(context.Background(), tracespec.TracingKey, mock)
+	WithContext(ctx).(*traceLogger).write(&buf, levelInfo, testlog)
+	assert.True(t, strings.Contains(buf.String(), mockTraceID))
+	assert.True(t, strings.Contains(buf.String(), mockSpanID))
+}
+
 func TestTraceLog(t *testing.T) {
 	var buf mockWriter
 	atomic.StoreUint32(&initialized, 1)

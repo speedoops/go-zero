@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -23,8 +24,12 @@ import (
 )
 
 const (
-	// InfoLevel logs everything
-	InfoLevel = iota
+	// DebugLevel logs everything
+	DebugLevel = iota
+	// InfoLevel includes infos
+	InfoLevel
+	// WarnLevel includes warnings, slows
+	WarnLevel
 	// ErrorLevel includes errors, slows, stacks
 	ErrorLevel
 	// SevereLevel only log severe messages
@@ -32,7 +37,9 @@ const (
 )
 
 const (
-	accessFilename = "access.log"
+	debugFilename  = "debug.log"
+	infoFilename   = "info.log"
+	warnFilename   = "warn.log"
 	errorFilename  = "error.log"
 	severeFilename = "severe.log"
 	slowFilename   = "slow.log"
@@ -40,9 +47,12 @@ const (
 
 	consoleMode = "console"
 	volumeMode  = "volume"
+	syslogMode  = "syslog"
 
 	levelAlert  = "alert"
+	levelDebug  = "debug"
 	levelInfo   = "info"
+	levelWarn   = "warn"
 	levelError  = "error"
 	levelSevere = "severe"
 	levelFatal  = "fatal"
@@ -64,25 +74,30 @@ var (
 
 	timeFormat   = "2006-01-02T15:04:05.000Z07"
 	writeConsole bool
+	writeRsyslog bool
 	logLevel     uint32
 	// use uint32 for atomic operations
 	disableStat uint32
+	debugLog    io.WriteCloser
 	infoLog     io.WriteCloser
+	warnLog     io.WriteCloser
 	errorLog    io.WriteCloser
 	severeLog   io.WriteCloser
 	slowLog     io.WriteCloser
 	statLog     io.WriteCloser
 	stackLog    io.Writer
 
-	once        sync.Once
-	initialized uint32
-	options     logOptions
+	once           sync.Once
+	initialized    uint32
+	options        logOptions
+	mode           string
+	formatToRawTxt bool
 )
 
 type (
 	logEntry struct {
-		Timestamp string      `json:"@timestamp"`
-		Level     string      `json:"level"`
+		Timestamp string      `json:"@timestamp,omitempty"`
+		Level     string      `json:"level,omitempty"`
 		Duration  string      `json:"duration,omitempty"`
 		Content   interface{} `json:"content"`
 	}
@@ -101,6 +116,10 @@ type (
 		Error(...interface{})
 		Errorf(string, ...interface{})
 		Errorv(interface{})
+		Warn(...interface{})
+		Warnf(string, ...interface{})
+		Debug(...interface{})
+		Debugf(string, ...interface{})
 		Info(...interface{})
 		Infof(string, ...interface{})
 		Infov(interface{})
@@ -121,14 +140,18 @@ func MustSetup(c LogConf) {
 // we need to allow different service frameworks to initialize logx respectively.
 // the same logic for SetUp
 func SetUp(c LogConf) error {
+	mode = c.Mode
 	if len(c.TimeFormat) > 0 {
 		timeFormat = c.TimeFormat
 	}
+	formatToRawTxt = c.FormatToRawTxt
 
 	switch c.Mode {
 	case consoleMode:
 		setupWithConsole(c)
 		return nil
+	case syslogMode:
+		return setupWithSyslog(c)
 	case volumeMode:
 		return setupWithVolume(c)
 	default:
@@ -153,8 +176,20 @@ func Close() error {
 
 	atomic.StoreUint32(&initialized, 0)
 
+	if debugLog != nil {
+		if err := debugLog.Close(); err != nil {
+			return err
+		}
+	}
+
 	if infoLog != nil {
 		if err := infoLog.Close(); err != nil {
+			return err
+		}
+	}
+
+	if warnLog != nil {
+		if err := warnLog.Close(); err != nil {
 			return err
 		}
 	}
@@ -191,7 +226,9 @@ func Disable() {
 	once.Do(func() {
 		atomic.StoreUint32(&initialized, 1)
 
+		debugLog = iox.NopCloser(ioutil.Discard)
 		infoLog = iox.NopCloser(ioutil.Discard)
+		warnLog = iox.NopCloser(ioutil.Discard)
 		errorLog = iox.NopCloser(ioutil.Discard)
 		severeLog = iox.NopCloser(ioutil.Discard)
 		slowLog = iox.NopCloser(ioutil.Discard)
@@ -243,6 +280,14 @@ func Errorv(v interface{}) {
 	errorAnySync(v)
 }
 
+func Warn(v ...interface{}) {
+	warnSync(fmt.Sprint(v...), callerInnerDepth)
+}
+
+func Warnf(format string, v ...interface{}) {
+	warnSync(fmt.Sprintf(format, v...), callerInnerDepth)
+}
+
 // Info writes v into access log.
 func Info(v ...interface{}) {
 	infoTextSync(fmt.Sprint(v...))
@@ -256,6 +301,14 @@ func Infof(format string, v ...interface{}) {
 // Infov writes v into access log with json content.
 func Infov(v interface{}) {
 	infoAnySync(v)
+}
+
+func Debug(v ...interface{}) {
+	debugTextSync(fmt.Sprint(v...))
+}
+
+func Debugf(format string, v ...interface{}) {
+	debugTextSync(fmt.Sprintf(format, v...))
 }
 
 // Must checks if err is nil, otherwise logs the err and exits.
@@ -350,6 +403,12 @@ func errorTextSync(msg string, callDepth int) {
 	}
 }
 
+func warnSync(msg string, callDepth int) {
+	if shallLog(WarnLevel) {
+		outputWarn(warnLog, msg, callDepth)
+	}
+}
+
 func formatWithCaller(msg string, callDepth int) string {
 	var buf strings.Builder
 
@@ -369,13 +428,18 @@ func getCaller(callDepth int) string {
 
 	_, file, line, ok := runtime.Caller(callDepth)
 	if ok {
+		pathLevel := 0
 		short := file
 		for i := len(file) - 1; i > 0; i-- {
-			if file[i] == '/' {
-				short = file[i+1:]
-				break
+			if file[i] == filepath.Separator {
+				pathLevel++
+				if pathLevel >= 2 {
+					short = file[i+1:]
+					break
+				}
 			}
 		}
+
 		buf.WriteString(short)
 		buf.WriteByte(':')
 		buf.WriteString(strconv.Itoa(line))
@@ -406,6 +470,12 @@ func infoTextSync(msg string) {
 	}
 }
 
+func debugTextSync(msg string) {
+	if shallLog(DebugLevel) {
+		outputText(debugLog, levelDebug, msg)
+	}
+}
+
 func outputAny(writer io.Writer, level string, val interface{}) {
 	info := logEntry{
 		Timestamp: getTimestamp(),
@@ -417,11 +487,37 @@ func outputAny(writer io.Writer, level string, val interface{}) {
 
 func outputText(writer io.Writer, level, msg string) {
 	info := logEntry{
-		Timestamp: getTimestamp(),
-		Level:     level,
-		Content:   msg,
+		// Timestamp: getTimestamp(),
+		// Level:     level,
+		Content: msg,
 	}
+	if !writeRsyslog {
+		info.Timestamp = getTimestamp()
+		info.Level = level
+	}
+
+	if formatToRawTxt {
+		text := fmt.Sprintf("%s %s: %s\n", info.Timestamp, info.Level, info.Content)
+		outputRawTxt(writer, text)
+		return
+	}
+
 	outputJson(writer, info)
+}
+
+// func outputWithCaller(writer io.Writer, level, msg string, callDepth int) {
+// 	content := formatWithCaller(msg, callDepth)
+// 	outputText(writer, level, content)
+// }
+
+func outputRawTxt(writer io.Writer, content string) {
+	if atomic.LoadUint32(&initialized) == 0 || writer == nil {
+		log.Println(content)
+		return
+	}
+
+	buf := append([]byte(nil), []byte(content)...)
+	writer.Write(buf)
 }
 
 func outputError(writer io.Writer, msg string, callDepth int) {
@@ -429,20 +525,49 @@ func outputError(writer io.Writer, msg string, callDepth int) {
 	outputText(writer, levelError, content)
 }
 
+func outputWarn(writer io.Writer, msg string, callDepth int) {
+	content := formatWithCaller(msg, callDepth)
+	outputText(writer, levelWarn, content)
+}
+
 func outputJson(writer io.Writer, info interface{}) {
-	if content, err := json.Marshal(info); err != nil {
-		log.Println(err.Error())
-	} else if atomic.LoadUint32(&initialized) == 0 || writer == nil {
-		log.Println(string(content))
-	} else {
-		writer.Write(append(content, '\n'))
+	// V1: 原始代码，对特殊字符会转义
+	// if content, err := json.Marshal(info); err != nil {
+	// 	log.Println(err.Error())
+	// } else if atomic.LoadUint32(&initialized) == 0 || writer == nil {
+	// 	log.Println(string(content))
+	// } else {
+	// 	writer.Write(append(content, '\n'))
+	// }
+
+	// V2: 修改后，对特殊字符不转义
+	if atomic.LoadUint32(&initialized) == 0 || writer == nil {
+		if content, err := json.Marshal(info); err != nil {
+			log.Println(err.Error())
+		} else {
+			log.Println(string(content))
+		}
+		return
 	}
+
+	var builder strings.Builder
+	enc := json.NewEncoder(&builder)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(info); err != nil {
+		log.Println(err.Error())
+	}
+	buf := append([]byte(nil), builder.String()...)
+	writer.Write(buf)
 }
 
 func setupLogLevel(c LogConf) {
 	switch c.Level {
+	case levelDebug:
+		SetLevel(DebugLevel)
 	case levelInfo:
 		SetLevel(InfoLevel)
+	case levelWarn:
+		SetLevel(WarnLevel)
 	case levelError:
 		SetLevel(ErrorLevel)
 	case levelSevere:
@@ -456,12 +581,14 @@ func setupWithConsole(c LogConf) {
 		writeConsole = true
 		setupLogLevel(c)
 
+		debugLog = newLogWriter(log.New(os.Stdout, "", flags))
 		infoLog = newLogWriter(log.New(os.Stdout, "", flags))
+		warnLog = newLogWriter(log.New(os.Stdout, "", flags))
 		errorLog = newLogWriter(log.New(os.Stderr, "", flags))
 		severeLog = newLogWriter(log.New(os.Stderr, "", flags))
 		slowLog = newLogWriter(log.New(os.Stderr, "", flags))
 		stackLog = newLessWriter(errorLog, options.logStackCooldownMills)
-		statLog = infoLog
+		statLog = debugLog
 	})
 }
 
@@ -481,7 +608,9 @@ func setupWithFiles(c LogConf) error {
 		opts = append(opts, WithKeepDays(c.KeepDays))
 	}
 
-	accessFile := path.Join(c.Path, accessFilename)
+	debugFile := path.Join(c.Path, debugFilename)
+	infoFile := path.Join(c.Path, infoFilename)
+	warnFile := path.Join(c.Path, warnFilename)
 	errorFile := path.Join(c.Path, errorFilename)
 	severeFile := path.Join(c.Path, severeFilename)
 	slowFile := path.Join(c.Path, slowFilename)
@@ -492,7 +621,15 @@ func setupWithFiles(c LogConf) error {
 		handleOptions(opts)
 		setupLogLevel(c)
 
-		if infoLog, err = createOutput(accessFile); err != nil {
+		if debugLog, err = createOutput(debugFile); err != nil {
+			return
+		}
+
+		if infoLog, err = createOutput(infoFile); err != nil {
+			return
+		}
+
+		if warnLog, err = createOutput(warnFile); err != nil {
 			return
 		}
 
@@ -542,13 +679,13 @@ func shallLogStat() bool {
 }
 
 func slowAnySync(v interface{}) {
-	if shallLog(ErrorLevel) {
+	if shallLog(WarnLevel) {
 		outputAny(slowLog, levelSlow, v)
 	}
 }
 
 func slowTextSync(msg string) {
-	if shallLog(ErrorLevel) {
+	if shallLog(WarnLevel) {
 		outputText(slowLog, levelSlow, msg)
 	}
 }
